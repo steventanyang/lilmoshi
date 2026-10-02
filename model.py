@@ -118,4 +118,21 @@ class CausalTransformer(nn.Module):
         return x
 
 
+class LilMoshi(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
 
+        self.text_emb = nn.Embedding(cfg.text_vocab_size, cfg.temporal_dim)
+
+        self.audio_embs = nn.ModuleList(
+            [nn.Embedding(cfg.audio_vocab_size, cfg.temporal_dim)
+             for _ in range(cfg.num_streams - 1)]
+        )
+
+    def embed(self, codes):
+        # codes = [B, K, T]
+        x = self.text_emb(codes[:, 0]) 
+        for k, emb in enumerate(self.audio_embs, start=1):
+            x = x + emb(codes[:, k])
+        return x

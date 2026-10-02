@@ -1,0 +1,13 @@
+[project]
+name = "lilmoshi"
+version = "0.0.1"
+description = "A small educational implementation of Moshi's language model."
+requires-python = ">=3.11"
+dependencies = ["torch", "numpy"]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

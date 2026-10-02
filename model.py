@@ -130,9 +130,29 @@ class LilMoshi(nn.Module):
              for _ in range(cfg.num_streams - 1)]
         )
 
+        self.temporal = CausalTransformer(
+            dim=cfg.temporal_dim,
+            heads=cfg.temporal_heads,
+            layers=cfg.temporal_layers,
+            ffn_dim=cfg.temporal_ffn_dim,
+            max_seq_len=cfg.max_seq_len,
+            dropout=cfg.dropout,
+        )
+        self.temporal_norm = nn.LayerNorm(cfg.temporal_dim)
+        self.text_head = nn.Linear(cfg.temporal_dim, cfg.text_vocab_size)
+
+
     def embed(self, codes):
         # codes = [B, K, T]
         x = self.text_emb(codes[:, 0]) 
         for k, emb in enumerate(self.audio_embs, start=1):
             x = x + emb(codes[:, k])
         return x
+
+    def temporal_forward(self, codes):
+        # codes: [B, K, T] -> h: [B, T, temporal_dim], text_logits: [B, T, text_vocab_size]
+        x = self.embed(codes)
+        h = self.temporal(x)
+        h = self.temporal_norm(h)
+        text_logits = self.text_head(h)
+        return h, text_logits

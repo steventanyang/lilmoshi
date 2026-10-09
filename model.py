@@ -141,6 +141,30 @@ class LilMoshi(nn.Module):
         self.temporal_norm = nn.LayerNorm(cfg.temporal_dim)
         self.text_head = nn.Linear(cfg.temporal_dim, cfg.text_vocab_size)
 
+        Q = cfg.num_moshi_audio_codebooks
+        self.depth_in = nn.ModuleList(
+            [nn.Linear(cfg.temporal_dim, cfg.depth_dim) for _ in range(Q)]
+        )
+
+        self.depth_text_emb = nn.Embedding(cfg.text_vocab_size, cfg.depth_dim)
+        self.depth_audio_embs = nn.ModuleList(
+            [nn.Embedding(cfg.audio_vocab_size, cfg.depth_dim) for _ in range(Q - 1)]
+        )
+
+        self.depth = CausalTransformer(
+            dim= cfg.depth_dim,
+            heads=cfg.depth_heads,
+            layers=cfg.depth_layers,
+            ffn_dim=cfg.depth_ffn_dim,
+            max_seq_len=Q,
+            dropout=cfg.dropout
+        )
+
+        self.depth_norms = nn.ModuleList([nn.LayerNorm(cfg.depth_dim) for _ in range(Q)])
+        self.audio_heads = nn.ModuleList(
+            [nn.Linear(cfg.depth_dim, cfg.audio_vocab_size) for _ in range(Q)]
+        )
+
 
     def embed(self, codes):
         # codes = [B, K, T]
@@ -156,3 +180,27 @@ class LilMoshi(nn.Module):
         h = self.temporal_norm(h)
         text_logits = self.text_head(h)
         return h, text_logits
+
+    def depth_forward_training(self, h, target):
+        # h: [B, T, Dt], target: [B, K, T] -> audio_logits: [B, Q, T, Va]
+        B, T, _ = h.shape
+        Q = self.cfg.num_moshi_audio_codebooks
+
+        inputs = []
+        for q in range(Q):
+            if q == 0:
+                token_in = self.depth_text_emb(target[:, 0]) 
+            else:
+                prev = self.cfg.moshi_audio_offset + q - 1               
+                token_in = self.depth_audio_embs[q - 1](target[:, prev])
+            inputs.append(token_in + self.depth_in[q](h))               
+
+        x = torch.stack(inputs, dim=2)
+        x = x.reshape(B * T, Q, -1)
+        y = self.depth(x)       
+
+        logits = []
+        for q in range(Q):
+            out = self.audio_heads[q](self.depth_norms[q](y[:, q])) 
+            logits.append(out.view(B, T, -1))                      
+        return torch.stack(logits, dim=1)                         

@@ -190,6 +190,13 @@ class LilMoshi(nn.Module):
         text_logits = self.text_head(h)
         return h, text_logits
 
+    def depth_step_input(self, q, h, prev_token):
+        if q == 0:
+            token_in = self.depth_text_emb(prev_token)
+        else:
+            token_in = self.depth_audio_embs[q - 1](prev_token)
+        return token_in + self.depth_in[q](h)
+
     def depth_forward_training(self, h, target):
         # h: [B, T, Dt], target: [B, K, T] -> audio_logits: [B, Q, T, Va]
         B, T, _ = h.shape
@@ -197,12 +204,9 @@ class LilMoshi(nn.Module):
 
         inputs = []
         for q in range(Q):
-            if q == 0:
-                token_in = self.depth_text_emb(target[:, 0]) 
-            else:
-                prev = self.cfg.moshi_audio_offset + q - 1               
-                token_in = self.depth_audio_embs[q - 1](target[:, prev])
-            inputs.append(token_in + self.depth_in[q](h))               
+            # teacher forcing: the previous token comes from the real target frame
+            prev = 0 if q == 0 else self.cfg.moshi_audio_offset + q - 1
+            inputs.append(self.depth_step_input(q, h, target[:, prev]))
 
         x = torch.stack(inputs, dim=2)
         x = x.reshape(B * T, Q, -1)
@@ -248,3 +252,35 @@ class LilMoshi(nn.Module):
             audio_loss=audio_loss,
             loss=text_loss + audio_loss,
         )
+    @torch.no_grad()
+    def generate_frame(self, history, next_user_audio):
+        # history: [B, K, T], next_user_audio: [B, Qu] -> new frame [B, K, 1]
+        # greedy decoding, no cache: reruns both Transformers on their full prefix
+        Q = self.cfg.num_moshi_audio_codebooks
+
+        # 1. big Transformer over all past frames; keep only the last position
+        h, text_logits = self.temporal_forward(history)
+        h = h[:, -1]                              # [B, Dt]
+        text = text_logits[:, -1].argmax(-1)      # [B]
+
+        # 2. small Transformer, one codebook at a time, feeding back its own picks
+        prev = text
+        steps, audio = [], []
+        for q in range(Q):
+            steps.append(self.depth_step_input(q, h, prev))   # [B, Dd]
+            y = self.depth(torch.stack(steps, dim=1))         # [B, q+1, Dd]
+            logits = self.audio_heads[q](self.depth_norms[q](y[:, -1]))
+            prev = logits.argmax(-1)                          # [B]
+            audio.append(prev)
+
+        # 3. assemble: [text, moshi q0..q(Q-1), user q0..] -> [B, K, 1]
+        frame = torch.cat([text[:, None], torch.stack(audio, dim=1), next_user_audio], dim=1)
+        return frame[:, :, None]
+
+    @torch.no_grad()
+    def generate(self, history, user_audio):
+        # history: [B, K, T], user_audio: [B, Qu, N] -> [B, K, T + N]
+        for n in range(user_audio.shape[2]):
+            frame = self.generate_frame(history, user_audio[:, :, n])
+            history = torch.cat([history, frame], dim=2)
+        return history

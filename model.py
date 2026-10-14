@@ -3,6 +3,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 @dataclass
@@ -118,6 +119,15 @@ class CausalTransformer(nn.Module):
         return x
 
 
+@dataclass
+class LilMoshiOutput:
+    text_logits: torch.Tensor   # [B, T-1, Vtext]
+    audio_logits: torch.Tensor  # [B, Q, T-1, Vaudio]
+    text_loss: torch.Tensor     # scalar
+    audio_loss: torch.Tensor    # scalar, mean over the Q codebooks
+    loss: torch.Tensor          # text_loss + audio_loss
+
+
 class LilMoshi(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -165,7 +175,6 @@ class LilMoshi(nn.Module):
             [nn.Linear(cfg.depth_dim, cfg.audio_vocab_size) for _ in range(Q)]
         )
 
-
     def embed(self, codes):
         # codes = [B, K, T]
         x = self.text_emb(codes[:, 0]) 
@@ -204,3 +213,38 @@ class LilMoshi(nn.Module):
             out = self.audio_heads[q](self.depth_norms[q](y[:, q])) 
             logits.append(out.view(B, T, -1))                      
         return torch.stack(logits, dim=1)                         
+
+    def forward(self, codes):
+        # codes: [B, K, T] -> LilMoshiOutput (logits over T-1 positions + losses)
+        Q = self.cfg.num_moshi_audio_codebooks
+
+        history = codes[:, :, :-1]   # [B, K, T-1]
+        target = codes[:, :, 1:]     # [B, K, T-1]
+
+        h, text_logits = self.temporal_forward(history)
+
+        audio_logits = self.depth_forward_training(h, target)
+
+        text_target = target[:, 0]
+        start = self.cfg.moshi_audio_offset
+        audio_target = target[:, start:start + Q]
+
+        text_loss = F.cross_entropy(
+            text_logits.reshape(-1, self.cfg.text_vocab_size),
+            text_target.reshape(-1),
+        )
+        audio_loss = torch.stack([
+            F.cross_entropy(
+                audio_logits[:, q].reshape(-1, self.cfg.audio_vocab_size),
+                audio_target[:, q].reshape(-1),
+            )
+            for q in range(Q)
+        ]).mean()
+
+        return LilMoshiOutput(
+            text_logits=text_logits,
+            audio_logits=audio_logits,
+            text_loss=text_loss,
+            audio_loss=audio_loss,
+            loss=text_loss + audio_loss,
+        )
